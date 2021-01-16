@@ -1,7 +1,17 @@
-import struct, sys, codecs
+import sys, codecs
+from functools import partial
+from struct import unpack
 '''
 >>> from xview import examine
 '''
+
+
+def _unpack_1(data, sfmt):
+    # note: the colon after 'obj' forces a tuple unpack. If
+    # the method returns anything else except a tuple with a single element
+    # this will fail (and it should it!)
+    obj, = unpack(sfmt, data)
+    return obj
 
 
 # https://sourceware.org/gdb/current/onlinedocs/gdb/Memory.html
@@ -58,26 +68,37 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
         >>> examine(b1, cols=None, fmt='r', unit='w', endianess='l')
         b'\x04\xfd\xff\xbe'  b'!\x00\x00\x00'
 
-        This is quite weird. It reads in packs of 4 bytes (word) but
-        it sees each pack as a single byte (doing module 256).
+        When the (c)har format is used, the interpretation of unit
+        changes: not only specifies how much bytes each character
+        will consume but also which encoding to use to decode it.
 
-        In gdb, the resulting value is print as decimal and in octal
-        but in our case we print it as a character and in hexadecimal.
-        If no character exists (it is not printable), the '?' is used
-        instead.
-        If the unit is (b)yte, the character will be interpreted as utf8;
-        (h)alf as utf16 and (w)ord as utf32. Other units are not allowed.
-        This is also a difference with gdb: gdb prints the decimal
-        module 256 while xview see the full number.
+            (b)yte reads 1 byte and decodes it as utf-8
+            (h)alf reads 2 bytes and decode them as utf-16
+            (w)ord reads 4 bytes and decode them as utf-32
+
+        (g)iant is not supported.
+
+        Note that utf-8 and utf-16 are *variable size* decoders:
+        a single character may require 1 or more bytes to be decoded
+        however xview will *not* read a variable amount of bytes;
+        the specified unit will be honored.
+
+        GDB does something weird in this case: it reads the same amount
+        of bytes than xview but then it sees the read number module 256
+        and print it as a char and an octal.
+
+        xview follows more the GDB approach of the 's' format.
 
         >>> examine(b1, cols=None, fmt='c', unit='w', endianess='l')
-        � befffd04  ! 00000021
+        �  !
+
+        Note that endianess plays a role here too:
 
         >>> examine(b1, cols=None, fmt='c', unit='h', endianess='l')
-        ﴄ fd04  뻿 beff  ! 0021  <...> 0000
+        ﴄ  뻿  ! <...>
 
         >>> examine(b1, cols=None, fmt='c', unit='h', endianess='b')
-        ӽ 04fd  ﾾ ffbe  ℀ 2100 <...> 0000
+        ӽ  ﾾ  ℀  <...>
 
         Float point works similar for (w)ords and (g)iants but it is
         not supported for (b)ytes and (h)alf. In those cases gdb rollbacks
@@ -147,9 +168,6 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
         assert sz in (4, 8)
         op = 'f' if sz == 4 else 'd'
 
-    # final format for struct.unpack
-    sfmt = sfmt + op
-
     # encoding for string-like examinations based on the object's size
     if fmt in ('c', 's'):
         enc = {1: 'utf-8', 2: 'utf-16', 4: 'utf-32'}[sz]
@@ -162,6 +180,19 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
         else:
             assert endianess == 'l'
             enc += '-le'
+
+    # final format for struct.unpack and method for unpacking;
+    # 'c' is special as it will not use struct.unpack at all
+    # but str
+    if fmt in ('c', ):
+        sfmt = None
+        unpack = partial(str, encoding=enc, errors='replace')
+    else:
+        sfmt = sfmt + op
+        unpack = partial(_unpack_1, sfmt=sfmt)
+
+    # not needed anymore
+    del sfmt
 
     # TODO not supported yet
     #if fmt == 's':
@@ -177,8 +208,8 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
         'u': ('d', 0),  # same as 'd'
         'o': ('o', 3),
         't': ('b', 8),
-        'c': ('x', 2),
         'f': ('e', 0),
+        'c': ('', 0),
         'r': ('', 0),
         's': ('', 0),
     }[fmt]
@@ -194,28 +225,15 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
     else:
         rfmt = '{0:{ftype}}'
 
-    # the 'c' is a dual representation:
-    if fmt == 'c':
-        rfmt = '{s} ' + rfmt
-
-    # shortcut
-    unpack = struct.unpack
-
-    s = ''
     offset = 0
     cnt = len(mem) // sz
     line = []
     for i, offset in enumerate(range(0, cnt * sz, sz), 1):
         m = mem[offset:offset + sz]
 
-        ret_tuple = unpack(sfmt, m)
-        assert len(ret_tuple) == 1
-        obj = ret_tuple[0]
+        obj = unpack(m)
 
-        if fmt == 'c':
-            s = str(m, enc, 'replace')
-
-        line.append(rfmt.format(obj, s=s, npad=npad, ftype=ftype))
+        line.append(rfmt.format(obj, npad=npad, ftype=ftype))
 
         if cols is None:
             assert len(line) == 1
