@@ -1,70 +1,119 @@
 import sys, codecs
 from functools import partial
 from struct import unpack
+from itertools import islice
+import string
+from more_itertools import peekable, take
+
+try:
+    import capstone
+    is_capstone_available = True
+except ImportError:
+    is_capstone_available = False
 '''
->>> from xview import examine
+>>> from xview import examine, Ex, Formatter
+
+>>> def print_iter1(it):
+...     print('\n'.join('%s' % t for t in it))
+
+>>> def print_iter2(it):
+...     print('\n'.join('%s  %s' % t for t in it))
 '''
+
+# what unicodes are control code?
+#   import unicodedata
+#   ctrl_codes = [i for i in range(sys.maxunicode+1)
+#                   if unicodedata.category(chr(i)) == 'Cc']
+#
+#   0 <= i <= 31 or 127 <= i <= 159
+#
+# whitespace control codes?: 9 <= i <= 13
+ctrl_tr = {
+    i: u'?' if
+    (0 <= i <= 31 or 127 <= i <= 159) and not (9 <= i <= 13) else chr(i)
+    for i in range(160)
+}
 
 
 class Ex:
-    def __init__(self, cols, fmt, unit, endianess, sep='  '):
-        self._validate_params(cols, fmt, unit, endianess, sep)
-        self._unpacker, self._sz = self._build_unpacker(fmt, unit, endianess)
+    def __init__(self, fmt, sz, endianess):
+        sz = self._alias_sz(sz)
+        self._validate_params(fmt, sz, endianess)
+        self._fmt = fmt
 
-        self._formatter = self._build_formatter(fmt, unit, endianess, self._sz)
+        self._unpacker, self._sz = self._build_unpacker(fmt, sz, endianess)
+        self._formatter = self._build_formatter(fmt, sz, endianess)
 
-        self._cols = cols
-        self._sep = sep
+    def _are_we_examining_instructions(self):
+        return self._fmt == 'i'
 
-    def _validate_params(self, cols, fmt, unit, endianess, sep):
-        if cols is not None and not (0 < cols <= 64):
+    def _alias_sz(self, sz):
+        if isinstance(sz, str) and sz.isdigit():
+            return int(sz)
+        return sz
+
+    def _validate_params(self, fmt, sz, endianess):
+        if fmt != 'i' and sz not in (1, 2, 4, 8):
             raise ValueError(
-                "Column count '%s' must be a number between 1 and 64 or None."
-                % cols
+                "Size '%s' unknown. Expected 1, 2, 4, or 8 bytes." % sz
             )
 
-        if unit not in ('b', 'h', 'w', 'g'):
-            raise ValueError(
-                "Unit '%s' unknown. Expected (b)yte, (h)alf, (w)ord or (g)iant."
-                % unit
-            )
+        if fmt == 'i':
+            try:
+                arch, mode = sz
+            except ValueError:
+                raise ValueError(
+                    "Unit must be a tuple with the architecture and mode for Capstone."
+                )
+
+            if not is_capstone_available:
+                raise ValueError("Capstone engine is not available.")
 
         if fmt not in (
-            'x', 'd', 'u', 'o', 't', 'a', 'c', 'f', 's', 'z', 'r', 'i'
+            'x', 'd', 'u', 'o', 'b', 'a', 'c', 'f', 's', 'z', 'r', 'i'
         ):
             raise ValueError(
-                "Format '%s' unknown. Expected he(x), signe(d), (u)nsigned, (o)ctal, (t)wo, (a)ddress, (c)har, (f)loat, (s)tring, (z)ero padded, (r)aw or (i)nstruction."
+                "Format '%s' unknown. Expected he(x), signe(d), (u)nsigned, (o)ctal, (b)inary, (a)ddress, (c)har, (f)loat, (s)tring, (z)ero padded, (r)aw or (i)nstruction."
                 % fmt
             )
 
-        if fmt == 'f' and unit not in ('w', 'g'):
+        if fmt == 'f' and sz not in (4, 8):
             raise ValueError(
-                "Format (f)loat can work only with (w)ords and (g)iants units but received '%s'"
-                % unit
+                "Format (f)loat can work only with 4 and 8 sizes but received '%s'"
+                % sz
             )
 
-        if fmt in ('c', 's') and unit == 'g':
-            raise ValueError("Format (c)har/(s)tring can work (g)iant units.")
+        if fmt in ('c', 's') and sz == 8:
+            raise ValueError(
+                "Format (c)har/(s)tring cannot work with sizes of 8 bytes."
+            )
 
-        if fmt in ('a', 'i', 'z', 's'):
+        if fmt in ('a', 'z', 's'):
             raise NotImplementedError("Format '%s' not supported yet." % fmt)
 
-        if endianess not in ('b', 'l', 'n'):
+        if endianess not in ('>', '<', '='):
             raise ValueError(
-                "Endianess type '%s' unknown. Expected (b)ig, (l)ittle or (n)ative."
+                "Endianess type '%s' unknown. Expected (>)big, (<)little or (=)native."
             )
 
-    def _build_unpacker(self, fmt, unit, endianess):
-        # format for struct.unpack
-        sfmt = {'b': '>', 'l': '<', 'n': '='}[endianess]
+    def _build_unpacker(self, fmt, sz, endianess):
+        if self._are_we_examining_instructions():
+            md = capstone.Cs(*sz)
+            md.skipdata = True
 
-        # struct.unpack opcode and size in bytes of the object
-        op, sz = {
-            'b': ('B', 1),
-            'h': ('H', 2),
-            'w': ('I', 4),
-            'g': ('L', 8),
-        }[unit]
+            unpack = partial(md.disasm_lite, offset=0)
+            return unpack, 0
+
+        # format for struct.unpack
+        sfmt = {'>': '>', '<': '<', '=': '='}[endianess]
+
+        # struct.unpack opcode of the object
+        op = {
+            1: 'B',
+            2: 'H',
+            4: 'I',
+            8: 'L',
+        }[sz]
 
         if fmt == 'r':
             op = '%is' % sz  # raw means raw string, no conversion
@@ -80,14 +129,16 @@ class Ex:
         if fmt in ('c', 's'):
             enc = {1: 'utf-8', 2: 'utf-16', 4: 'utf-32'}[sz]
 
-            force_big_endian = endianess == 'b' or (
-                endianess == 'n' and sys.byteorder == 'big'
+            force_big_endian = endianess == '>' or (
+                endianess == '=' and sys.byteorder == 'big'
             )
-            if force_big_endian:
-                enc += '-be'
-            else:
-                assert endianess == 'l'
-                enc += '-le'
+
+            if sz != 1:
+                if force_big_endian:
+                    enc += '-be'
+                else:
+                    assert endianess == '<'
+                    enc += '-le'
 
         # final format for struct.unpack and method for unpacking;
         # 'c' is special as it will not use struct.unpack at all
@@ -101,14 +152,17 @@ class Ex:
 
         return unpack, sz
 
-    def _build_formatter(self, fmt, unit, endianess, sz):
+    def _build_formatter(self, fmt, sz, endianess):
+        if self._are_we_examining_instructions():
+            return _format_ins
+
         # representation type (method format()) and padding per byte
         ftype, npad = {
             'x': ('x', 2),
             'd': ('d', 0),
             'u': ('d', 0),  # same as 'd'
             'o': ('o', 3),
-            't': ('b', 8),
+            'b': ('b', 8),
             'f': ('e', 0),
             'c': ('', 0),
             'r': ('', 0),
@@ -126,16 +180,166 @@ class Ex:
         else:
             rfmt = '{0:{ftype}}'
 
-        return partial(_format_1, rfmt=rfmt, npad=npad, ftype=ftype)
+        if fmt == 'c':
+            return partial(_format_c, rfmt=rfmt, npad=npad, ftype=ftype)
+        else:
+            return partial(_format_1, rfmt=rfmt, npad=npad, ftype=ftype)
 
-    def print(self, mem):
-        mem = memoryview(mem)  # avoid copies when slicing
-        cols = self._cols
-        sep = self._sep
+    def examine_iter(self, mem, start_addr=0):
+        ''' Iterate over the given bytes yielding (addr, output) tuples.
 
-        sz = self._sz
+            The addresses are the offset in the input where the elements
+            were taken and the output are their representations as strings.
+
+            Optionally the starting address can be specified.
+
+            <mem> can be bytes or a memoryview. If the format specified
+            in the constructor was (i)nstructions, <mem> must be bytes.
+
+            Examples:
+
+            >>> b1 = bytes.fromhex('04fdffbe21000000')
+
+            1 byte in hexadecimal notation:
+            >>> print_iter2(Ex(fmt='x', sz=1, endianess='>').examine_iter(b1))
+            0  04
+            1  fd
+            2  ff
+            3  be
+            4  21
+            5  00
+            6  00
+            7  00
+
+            4 bytes in hexadecimal, reading in little and big endian:
+            >>> print_iter2(Ex(fmt='x', sz=4, endianess='<').examine_iter(b1))
+            0  befffd04
+            4  00000021
+
+            >>> print_iter2(Ex(fmt='x', sz=4, endianess='>').examine_iter(b1))
+            0  04fdffbe
+            4  21000000
+
+            Big endian is equivalent to do slicing from the input bytes:
+            >>> b1[0:4].hex(), b1[4:8].hex()
+            ('04fdffbe', '21000000')
+
+            Decimal (signed (d) and unsigned (u)) interpretations:
+
+            >>> print_iter2(Ex(fmt='d', sz=4, endianess='<').examine_iter(b1))
+            0  -1090519804
+            4  33
+
+            >>> print_iter2(Ex(fmt='u', sz=4, endianess='<').examine_iter(b1))
+            0  3204447492
+            4  33
+
+            Octal (o) and binary (b) interpretations:
+
+            >>> print_iter2(Ex(fmt='o', sz=4, endianess='<').examine_iter(b1))
+            0  027677776404
+            4  000000000041
+
+            >>> print_iter2(Ex(fmt='b', sz=4, endianess='<').examine_iter(b1))
+            0  10111110111111111111110100000100
+            4  00000000000000000000000000100001
+
+            Raw strings (like slicing) (the endianess is ignored)
+            >>> print_iter2(Ex(fmt='r', sz=4, endianess='<').examine_iter(b1))
+            0  b'\x04\xfd\xff\xbe'
+            4  b'!\x00\x00\x00'
+
+            When the (c)har format is used, the interpretation of <sz>
+            changes: not only specifies how much bytes each character
+            will consume but also which encoding to use to decode it.
+
+                sz==1 reads 1 byte and decodes it as utf-8
+                sz==2 reads 2 bytes and decode them as utf-16
+                sz==4 reads 4 bytes and decode them as utf-32
+
+            Sizes of 8 are not supported.
+
+            Note that utf-8 and utf-16 are *variable size* decoders:
+            a single character may require 1 or more bytes to be decoded.
+
+            However xview will *not* read a variable amount of bytes;
+            the specified size will be honored.
+
+            >>> print_iter2(Ex(fmt='c', sz=1, endianess='<').examine_iter(b1))
+            0  ?
+            1  �
+            2  �
+            3  �
+            4  !
+            5  ?
+            6  ?
+            7  ?
+
+            >>> print_iter2(Ex(fmt='c', sz=4, endianess='<').examine_iter(b1))
+            0  �
+            4  !
+
+            Note that endianess plays a role here too:
+
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='<').examine_iter(b1))
+            0  ﴄ
+            2  뻿
+            4  !
+            6  ?
+
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='>').examine_iter(b1))
+            0  ӽ
+            2  ﾾ
+            4  ℀
+            6  ?
+
+            Float point interpretation is supported only for 4 and
+            8 bytes sizes.
+
+            >>> print_iter2(Ex(fmt='f', sz=4, endianess='<').examine_iter(b1))
+            0  -4.999772e-01
+            4  4.624285e-44
+
+            >>> print_iter2(Ex(fmt='f', sz=8, endianess='<').examine_iter(b1))
+            0  7.160907e-313
+
+            >>> print_iter2(Ex(fmt='f', sz=2, endianess='<').examine_iter(b1))
+            Traceback<...>
+            ValueError: Format (f)loat can work only with 4 and 8 sizes but received '2'
+
+            Instructions are decoded too and invalid opcodes are marked
+            as "bytes":
+            >>> from capstone import *
+            >>> print_iter2(Ex(fmt='i', sz=(CS_ARCH_X86, CS_MODE_64), endianess='<').examine_iter(b1))
+            0  add     al, 0xfd
+            2  .byte   0xff
+            3  mov     esi, 0x21
+            '''
+        if self._are_we_examining_instructions():
+            if not isinstance(mem, bytes):
+                raise TypeError(
+                    "Input memory must by of type 'bytes' but '%s' was found."
+                    % type(mem)
+                )
+            yield from self._examine_instr_iter(mem, start_addr)
+        else:
+            yield from self._examine_mem_slices_iter(mem, start_addr)
+
+    def _examine_instr_iter(self, mem, start_addr):
+        assert self._are_we_examining_instructions()
         unpack = self._unpacker
         formatter = self._formatter
+
+        for addr, size, mnemonic, op_str in unpack(mem, offset=start_addr):
+            yield (addr, formatter(mnemonic, op_str, size=size))
+
+    def _examine_mem_slices_iter(self, mem, start_addr):
+        assert not self._are_we_examining_instructions()
+        unpack = self._unpacker
+        formatter = self._formatter
+
+        mem = memoryview(mem)  # avoid copies when slicing
+        sz = self._sz
 
         offset = 0
         cnt = len(mem) // sz
@@ -144,20 +348,207 @@ class Ex:
             m = mem[offset:offset + sz]
 
             obj = unpack(m)
+            yield start_addr + offset, formatter(obj)
 
-            line.append(formatter(obj))
 
-            if cols is None:
-                assert len(line) == 1
-                print(*line, end=sep)
-                line.clear()
+class Formatter:
+    def __init__(self, line_fmt, *exs_in_args, **exs_in_kwargs):
+        self._line_fmt = line_fmt
+        self._examiner_by_key = {
+            str(ix): ex
+            for ix, ex in enumerate(exs_in_args)
+        }
+        self._examiner_by_key.update(exs_in_kwargs)
+        self._formatter = string.Formatter()
 
-            elif i % cols == 0:
-                print(*line, sep=sep)
-                line.clear()
+    def _line_template(self, mem, start_addr):
+        ''' Return a list of tuples (<literal_text>, <examiner it>,
+            <length>, <separator>, <width>, <fill>).
 
-        if line:
-            print(*line, sep=sep)
+            Each tuple describe what literal text forms the line before the
+            output of the examiner (the literal could be empty).
+
+            The examiner's iterator is already initialized with <mem> and
+            <start_addr>.
+
+            The <length> defines how many elements from the iterator should
+            be read and joined with <separator> to form the output that
+            follows the literal text.
+
+            Which of the examiners defined in __init__ is chosen is
+            based on the <field_name> extracted from <self._line_fmt>.
+
+            The <length> and the <separator> for each iterator is extracted
+            from that <self._line_fmt> too.
+
+            The examiner's iterator can be None in which should be ignored.
+
+            The <self._line_fmt> defines the <literal_text>s, <examiner it>s,
+            <length>s and <separator>s (in plural).
+
+            The syntax is similar to the Python Format String
+            https://docs.python.org/3/library/string.html#formatstrings.
+
+            Here is an example:
+
+            >>> line_fmt = "line: {0:8/ /23/ }  {0:8/ /23/ } | {1:8/} {1:8/}"
+
+            The <self._line_fmt> uses 2 examiners "0" ans "1". There
+            are 2 "calls" to each examiner: 2 calls are made
+            to the examiner "0" to read 8 elements in each occasion ({0:8/ /23/ })
+            and 2 more calls to the examiner "1" also to read 8 elements
+            ({1:8/}).
+
+            After the ":" a serie of parameters can be configured
+            separated with "/":
+
+                - <length>: how many entries read from the examiner
+                - <separator>: with which string join the entries read
+                - <width>: the total width of the output
+                - <fill>: with which string the field will be filled if
+                  the output is less than <width>
+
+            In {0:8/ /23/ }, we say 8 entries are read from the examiner
+            "0", joined with a space and the whole output is filled
+            with a space if the string is less than 23.
+
+            The separator, width and fill string can be omitted:
+                {0:8/ /23}  use a default fill (a space)
+                {0:8/ }     no fill at all
+                {0:8}       use a default separator (a space); no fill either
+
+            In {1:8/} the separator is the empty string.
+
+            So, we need to create the examiners "0" and "1":
+
+            >>> ex0 = Ex(fmt='x', sz=1, endianess='>')
+            >>> ex1 = Ex(fmt='c', sz=1, endianess='>')
+
+            Note the examiners not necessary must have the same "size"
+            (bytes to read) however you need to make sure that the
+            bytes per read times the lengths for that examiner
+            coincide. In other words, the *total* bytes read for
+            each examiner must be the same otherwise one examiner
+            will advance faster than other.
+
+            >>> b1 = bytes.fromhex('04fdffbe2100000041412121')
+            >>> f = Formatter(line_fmt, ex0, ex1)
+
+            ### print('\n'.join(str(t) for t in f._line_template(b1, start_addr=1)))
+            ('line: ', <...>, 8, ' ', 23, ' ')
+            ('  ', <...>, 8, ' ', 23, ' ')
+            (' | ', <...>, 8, '', 0, ' ')
+            (' ', <...>, 8, '', 0, ' ')
+
+        '''
+        results = []
+        f = self._formatter
+        line_fmt = self._line_fmt
+
+        RULE = None
+        initialized = {}
+        for literal_text, field_name, format_spec, conversion in f.parse(
+            line_fmt
+        ):
+            if field_name is not None:
+                if field_name == '':
+                    raise ValueError("Empty field names is not supported")
+
+                if field_name == 'addr':
+                    # TODO
+                    raise NotImplementedError("Not supported yet")
+
+                it = self.get_iter(field_name, mem, start_addr, initialized)
+                RULE = it
+
+                # examples:
+                #   {0:8/.} denotes 8 elements from the stream 0 joined
+                #           with a dot
+                #   {0:8/}  denotes 8 elements from the stream 0 joined
+                #   {0:8/ } denotes 8 elements from the stream 0 joined
+                #           with a space
+                #   {0:8}   denotes 8 elements from the stream 0 joined
+                #           with the default separator.
+                tmp = format_spec.split('/')
+                separator, width, fill = ' ', 0, ' '  # defaults
+                if len(tmp) == 1:
+                    length = tmp[0]
+                elif len(tmp) == 2:
+                    length, separator = tmp
+                elif len(tmp) == 3:
+                    length, separator, width = tmp
+                elif len(tmp) == 4:
+                    length, separator, width, fill = tmp
+                else:
+                    raise ValueError("Invalid format")
+
+                length = int(length)
+                width = int(width)
+
+            else:
+                it, length, separator, width, fill = None, None, None, None, None
+
+            results.append((literal_text, it, length, separator, width, fill))
+
+        # TODO check initialized against self._examiner_by_key
+        return results, initialized, RULE
+
+    def _lines(self, mem, start_addr):
+        ''' Yields formatted lines from the examined <mem>.
+            See _line_template.
+
+            >>> line_fmt = "line: {0:4/ /11}  {0:4/ /11} | {1:4//4} {1:4//4}"
+            >>> ex0 = Ex(fmt='x', sz=1, endianess='>')
+            >>> ex1 = Ex(fmt='x', sz=1, endianess='>')
+
+            >>> b1 = bytes.fromhex('04fdffbe2100000041412121')
+            >>> f = Formatter(line_fmt, ex0, ex1)
+
+            >>> print_iter2(f._lines(b1, start_addr=1))
+            1  line: 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
+            9  line: 41 41 21 21              | 41412121
+
+        '''
+        line = []
+        template, initialized, RULE = self._line_template(mem, start_addr)
+        exhausted = set()
+        line_addr = None
+        while len(exhausted) < len(initialized):
+            line_addr = RULE.peek()[0]
+            for literal_text, examiner_it, length, separator, width, fill in template:
+                if literal_text is not None:
+                    line.append(literal_text)
+
+                if examiner_it is not None and examiner_it not in exhausted:
+                    # TODO addr is dropped
+                    addr_out = take(length, examiner_it)
+                    if len(addr_out) < length:
+                        exhausted.add(examiner_it)
+                    out = separator.join(out for _, out in addr_out)
+                    if width:
+                        out = out.ljust(width, fill)
+                    line.append(out)
+
+            if line:
+                yield (line_addr, ''.join(line))
+                line = []
+
+    def get_iter(self, key, mem, start_addr, initialized):
+        ''' Return an examiner's iterator. The examiner is
+            chosen by key and initialized with <mem>
+            and <start_addr> if it was not initialized
+            previously.
+
+            Otherwise, return and already initialized
+            iterator.
+            '''
+        try:
+            return initialized[key]
+        except KeyError:
+            ex = self._examiner_by_key[key]
+            it = peekable(ex.examine_iter(mem, start_addr))
+            initialized[key] = it
+            return it
 
 
 def _unpack_1(data, sfmt):
@@ -172,12 +563,24 @@ def _format_1(obj, rfmt, **kargs):
     return rfmt.format(obj, **kargs)
 
 
+def _format_c(obj, rfmt, **kargs):
+    return rfmt.format(obj, **kargs).translate(ctrl_tr)
+
+
+def _format_ins(mnemonic, op_str, **kargs):
+    return ''.join((mnemonic.ljust(8), op_str))
+
+
 # https://sourceware.org/gdb/current/onlinedocs/gdb/Memory.html
 # https://sourceware.org/gdb/current/onlinedocs/gdb/Output-Formats.html#Output-Formats
 # https://blog.mattjustice.com/2018/08/24/gdb-for-windbg-users/
 # invalid utf16: string s = "a\ud800b";
-def examine(mem, cols, fmt, unit, endianess, sep='  '):
-    '''
+def examine(mem, fmt, sz, endianess, cols=4, sep='  '):
+    ''' Examine a piece of memory <mem> in a similar but exactly
+        way that the GNU Debugger GDB does.
+
+        Assume the following bytes to be examined:
+
         >>> b1 = bytes.fromhex('04fdffbe21000000')
 
         The left lower-index side of the bytes are interpreted as
@@ -185,87 +588,123 @@ def examine(mem, cols, fmt, unit, endianess, sep='  '):
 
         When you see the memory as a sequence of bytes this
         is not important:
-        >>> examine(b1, cols=None, fmt='x', unit='b', endianess='b')
-        04  fd  ff  be  21  00  00  00
+        >>> examine(b1, fmt='x', sz=1, endianess='>')
+        04  fd  ff  be
+        21  00  00  00
+
+        In the example we saw the memory as bytes (sz=1) in hexadecimal
+        notation (fmt='x').
 
         But when you see it as elements of more than one byte it is
-        because the endianess plays a role here:
+        where the endianess plays a role and which byte is less or
+        more significant is important.
 
         Little endian (left/lower addresses are less significant;
         "bytes are swapped"):
-        >>> examine(b1, cols=None, fmt='x', unit='w', endianess='l')
+        >>> examine(b1, fmt='x', sz=4, endianess='<')
         befffd04  00000021
 
         Big endian (left/lower addresses are more significant;
         "bytes are not swapped"):
-        >>> examine(b1, cols=None, fmt='x', unit='w', endianess='b')
+        >>> examine(b1, fmt='x', sz=4, endianess='>')
         04fdffbe  21000000
 
-        Decimal (signed and unsigned) interpretations:
+        Big endian is equivalent to do slicing from the input bytes:
+        >>> b1[0:4].hex(), b1[4:8].hex()
+        ('04fdffbe', '21000000')
 
-        >>> examine(b1, cols=None, fmt='d', unit='w', endianess='l')
+        Decimal (signed (d) and unsigned (u)) interpretations:
+
+        >>> examine(b1, fmt='d', sz=4, endianess='<')
         -1090519804  33
 
-        >>> examine(b1, cols=None, fmt='u', unit='w', endianess='l')
+        >>> examine(b1, fmt='u', sz=4, endianess='<')
         3204447492  33
 
-        This differs a little from gdb's output where the last number (1)
-        is padded with a single 0 while in our case is padded to complete
-        the necessary digits to represent a 4 bytes (word) number.
+        Octal (o) and binary (b) interpretations are also available.
+        Them differs a little from GDB's output: we always pad the
+        numbers' representations to complete the given size (4 bytes
+        in the next example):
 
-        >>> examine(b1, cols=None, fmt='o', unit='w', endianess='l')
+        >>> examine(b1, fmt='o', sz=4, endianess='<')
         027677776404  000000000041
 
-        >>> examine(b1, cols=None, fmt='t', unit='w', endianess='l')
+        >>> examine(b1, fmt='b', sz=4, endianess='<')
         10111110111111111111110100000100  00000000000000000000000000100001
 
-        This differs from gdb: 'raw' means for gdb 'do not pretty print'.
-        Because such pretty print does not exist in out case, 'raw' means
-        print the byte strings (and ignore the endianess)
+        Note: GDB uses 't' for binary.
 
-        >>> examine(b1, cols=None, fmt='r', unit='w', endianess='l')
+        A raw (r) view also exists and it is equivalent to do slicing
+        (endianess here is ignore and forced to be 'big endian'.
+
+        This differs from GDB where 'raw' means 'do not pretty print'.
+        Not applicable to us.
+
+        >>> examine(b1, fmt='r', sz=4, endianess='<')
         b'\x04\xfd\xff\xbe'  b'!\x00\x00\x00'
 
-        When the (c)har format is used, the interpretation of unit
+        When the (c)har format is used, the interpretation of <sz>
         changes: not only specifies how much bytes each character
         will consume but also which encoding to use to decode it.
 
-            (b)yte reads 1 byte and decodes it as utf-8
-            (h)alf reads 2 bytes and decode them as utf-16
-            (w)ord reads 4 bytes and decode them as utf-32
+            sz==1 reads 1 byte and decodes it as utf-8
+            sz==2 reads 2 bytes and decode them as utf-16
+            sz==4 reads 4 bytes and decode them as utf-32
 
-        (g)iant is not supported.
+        Sizes of 8 are not supported.
 
         Note that utf-8 and utf-16 are *variable size* decoders:
-        a single character may require 1 or more bytes to be decoded
-        however xview will *not* read a variable amount of bytes;
-        the specified unit will be honored.
+        a single character may require 1 or more bytes to be decoded.
+
+        However xview will *not* read a variable amount of bytes;
+        the specified size will be honored.
 
         GDB does something weird in this case: it reads the same amount
         of bytes than xview but then it sees the read number module 256
         and print it as a char and an octal.
 
-        xview follows more the GDB approach of the 's' format.
+        We believe that this is less usable. Instead xview follows
+        more the GDB approach of the 's' format and tries to show
+        the input as strings.
 
-        >>> examine(b1, cols=None, fmt='c', unit='w', endianess='l')
+        The following shows the input as two characters (c) of
+        4 bytes each one in utf-32:
+
+        >>> examine(b1, fmt='c', sz=4, endianess='<')
         �  !
 
         Note that endianess plays a role here too:
 
-        >>> examine(b1, cols=None, fmt='c', unit='h', endianess='l')
+        >>> examine(b1, fmt='c', sz=2, endianess='<')
         ﴄ  뻿  ! <...>
 
-        >>> examine(b1, cols=None, fmt='c', unit='h', endianess='b')
+        >>> examine(b1, fmt='c', sz=2, endianess='>')
         ӽ  ﾾ  ℀  <...>
 
-        Float point works similar for (w)ords and (g)iants but it is
-        not supported for (b)ytes and (h)alf. In those cases gdb rollbacks
-        to a decimal notation.
-        >>> examine(b1, cols=None, fmt='f', unit='w', endianess='l')
+        Float point interpretation is supported only for 4 and
+        8 bytes sizes.
+
+        >>> examine(b1, fmt='f', sz=4, endianess='<')
         -4.999772e-01  4.624285e-44
 
-        >>> examine(b1, cols=None, fmt='f', unit='g', endianess='l')
+        >>> examine(b1, fmt='f', sz=8, endianess='<')
         7.160907e-313
 
+        >>> examine(b1, fmt='f', sz=2, endianess='<')
+        Traceback<...>
+        ValueError: Format (f)loat can work only with 4 and 8 sizes but received '2'
+
+        >>> from capstone import *
+        >>> examine(b1, cols=1, fmt='i', sz=(CS_ARCH_X86, CS_MODE_64), endianess='<')
+        add     al, 0xfd
+        .byte   0xff
+        mov     esi, 0x21
         '''
-    return Ex(cols, fmt, unit, endianess, sep).print(mem)
+    ex = Ex(fmt, sz, endianess)
+    line_fmt = '{0:%i/%s}' % (cols, sep)
+    print(
+        '\n'.join(
+            out
+            for _, out in Formatter(line_fmt, ex)._lines(mem, start_addr=0)
+        )
+    )

@@ -23,6 +23,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 try:
-    from .xview import examine
+    from .xview import examine, Ex, Formatter
 except (SystemError, ImportError):
     pass  # this happens when importing from setup.py
