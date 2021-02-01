@@ -32,13 +32,11 @@ ctrl_tr = {
     i: u'.' if (0 <= i <= 31 or 127 <= i <= 159) else chr(i)
     for i in range(160)
 }
-
-## (0 <= i <= 31 or 127 <= i <= 159) and not (9 <= i <= 13) else chr(i)
+ctrl_tr[65533] = u'.'
 
 
 class Ex:
     def __init__(self, fmt, sz, endianess):
-        sz = self._alias_sz(sz)
         self._validate_params(fmt, sz, endianess)
         self._fmt = fmt
 
@@ -47,11 +45,6 @@ class Ex:
 
     def _are_we_examining_instructions(self):
         return self._fmt == 'i'
-
-    def _alias_sz(self, sz):
-        if isinstance(sz, str) and sz.isdigit():
-            return int(sz)
-        return sz
 
     def _validate_params(self, fmt, sz, endianess):
         if fmt != 'i' and sz not in (1, 2, 4, 8):
@@ -109,11 +102,12 @@ class Ex:
         sfmt = {'>': '>', '<': '<', '=': '='}[endianess]
 
         # struct.unpack opcode of the object
+        # https://docs.python.org/3.8/library/struct.html#format-characters
         op = {
             1: 'B',
             2: 'H',
             4: 'I',
-            8: 'L',
+            8: 'Q',
         }[sz]
 
         if fmt == 'r':
@@ -266,33 +260,33 @@ class Ex:
             However xview will *not* read a variable amount of bytes;
             the specified size will be honored.
 
-            >>> print_iter2(Ex(fmt='c', sz=1, endianess='<').examine_iter(b1))  # byexample: +skip
-            0  ?
-            1  �
-            2  �
-            3  �
+            >>> print_iter2(Ex(fmt='c', sz=1, endianess='<').examine_iter(b1))
+            0  .
+            1  .
+            2  .
+            3  .
             4  !
-            5  ?
-            6  ?
-            7  ?
+            5  .
+            6  .
+            7  .
 
-            >>> print_iter2(Ex(fmt='c', sz=4, endianess='<').examine_iter(b1))  # byexample: +skip
-            0  �
+            >>> print_iter2(Ex(fmt='c', sz=4, endianess='<').examine_iter(b1))
+            0  .
             4  !
 
             Note that endianess plays a role here too:
 
-            >>> print_iter2(Ex(fmt='c', sz=2, endianess='<').examine_iter(b1))  # byexample: +skip
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='<').examine_iter(b1))
             0  ﴄ
             2  뻿
             4  !
-            6  ?
+            6  .
 
-            >>> print_iter2(Ex(fmt='c', sz=2, endianess='>').examine_iter(b1))  # byexample: +skip
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='>').examine_iter(b1))
             0  ӽ
             2  ﾾ
             4  ℀
-            6  ?
+            6  .
 
             Float point interpretation is supported only for 4 and
             8 bytes sizes.
@@ -682,7 +676,7 @@ def examine(mem, fmt, sz, endianess, cols=4, sep='  '):
         4 bytes each one in utf-32:
 
         >>> examine(b1, fmt='c', sz=4, endianess='<')
-        �  !
+        .  !
 
         Note that endianess plays a role here too:
 
@@ -721,7 +715,7 @@ def examine(mem, fmt, sz, endianess, cols=4, sep='  '):
     )
 
 
-def idisplay(spec, mem):
+def idisplay(spec, mem, endianess='='):
     '''
         >>> b1 = bytes.fromhex('255044462d312e320d25e2e3cfd30d0a323234372030206f626a0d3c3c200d2f4c696e656172697a65642031200d')
 
@@ -738,74 +732,86 @@ def idisplay(spec, mem):
               the address then the 8 words in hexadecimal and then the
               same bytes in ASCII. If the byte is not printable, a period
               is used.
+              Note: the endianess by default is the endianess if the
+              host/machine but it can be changed to big endian (>) or
+              little endian (<).
+              Note: if the input is not multiple of 4, the last bytes
+              will not be displayed in the hexadecimal part because
+              they don't form a 4-bytes word, however they will be
+              displayed in the ASCII part.
 
-        >>> display('db', b1)
+        >>> display('dc', b1)
+        00000000  46445025 322e312d e3e2250d 0a0dd3cf  |%PDF-1.2.%......|
+        00000010  37343232 6f203020 3c0d6a62 2f0d203c  |2247 0 obj.<< ./|
+        00000020  656e694c 7a697261 31206465           |Linearized 1 .  |
+
+        >>> display('dc', b1, endianess='>')
         00000000  25504446 2d312e32 0d25e2e3 cfd30d0a  |%PDF-1.2.%......|
         00000010  32323437 2030206f 626a0d3c 3c200d2f  |2247 0 obj.<< ./|
-        00000020  4c696e65 6172697a 65642031 200d      |Linearized 1 .  |
+        00000020  4c696e65 6172697a 65642031           |Linearized 1 .  |
 
         'dd': display lines of 4 words (4 bytes each) from <mem> like in 'dc'
               but without the ASCII representation.
 
-        >>> display('db', b1)
-        00000000  25504446 2d312e32 0d25e2e3 cfd30d0a
-        00000010  32323437 2030206f 626a0d3c 3c200d2f
-        00000020  4c696e65 6172697a 65642031 200d
+        >>> display('dd', b1)
+        00000000  46445025 322e312d e3e2250d 0a0dd3cf
+        00000010  37343232 6f203020 3c0d6a62 2f0d203c
+        00000020  656e694c 7a697261 31206465
 
         'dD': display lines of 4 double precision float (8 bytes each)
               from <mem>.
 
         >>> display('dD', b1)
-        00000000
-        00000020
+        00000000  5.599436e-67  3.031161e-260  1.917431e+227  4.797675e-82
+        00000020  4.619119e+281
 
         'df': like 'dD' but display simple precision floats (4 bytes each)
 
-        >>> display('dD', b1)
-        00000000
-        00000010
-        00000020
+        >>> display('df', b1)
+        00000000  1.256404e+04  1.013931e-08  -8.343268e+21  6.828740e-33
+        00000010  1.074052e-05  4.957578e+28  8.631321e-03  1.283533e-10
+        00000020  7.036660e+22  3.030313e+35  2.334013e-09
 
         'dq': display lines of 2 quads (8 bytes each) from <mem>
 
         >>> display('dq', b1)
-        00000000
-        00000010
-        00000020
+        00000000  322e312d46445025  0a0dd3cfe3e2250d
+        00000010  6f20302037343232  2f0d203c3c0d6a62
+        00000020  7a697261656e694c
 
         References:
         https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/d--da--db--dc--dd--dd--df--dp--dq--du--dw--dw--dyb--dyd--display-memor
         '''
 
     if spec == 'db':
-        line_fmt = '{addr:08x}  {0:8/ /23}-{0:8/ /23}  |{1:16/}|'
+        line_fmt = '{addr:08x}  {0:8/ /23}-{0:8/ /23}  |{1:16//16}|'
         exs = [
-            Ex(fmt='x', sz=1, endianess='='),
-            Ex(fmt='c', sz=1, endianess='=')
+            Ex(fmt='x', sz=1, endianess=endianess),
+            Ex(fmt='c', sz=1, endianess=endianess)
         ]
     elif spec == 'dc':
-        line_fmt = '{addr:08x}  {0:4/ /19}  |{1:16/}|'
+        line_fmt = '{addr:08x}  {0:4/ /35}  |{1:16//16}|'
         exs = [
-            Ex(fmt='x', sz=4, endianess='='),
-            Ex(fmt='c', sz=1, endianess='=')
+            Ex(fmt='x', sz=4, endianess=endianess),
+            Ex(fmt='c', sz=1, endianess=endianess)
         ]
     elif spec == 'dd':
         line_fmt = '{addr:08x}  {0:4/ /19}'
-        exs = [Ex(fmt='x', sz=4, endianess='=')]
+        exs = [Ex(fmt='x', sz=4, endianess=endianess)]
     elif spec == 'dD':
-        line_fmt = '{addr:08x}  {0:4/ }'
-        exs = [Ex(fmt='f', sz=8, endianess='=')]
+        line_fmt = '{addr:08x}  {0:4/  }'
+        exs = [Ex(fmt='f', sz=8, endianess=endianess)]
     elif spec == 'df':
-        line_fmt = '{addr:08x}  {0:4/ }'
-        exs = [Ex(fmt='f', sz=4, endianess='=')]
+        line_fmt = '{addr:08x}  {0:4/  }'
+        exs = [Ex(fmt='f', sz=4, endianess=endianess)]
     elif spec == 'dq':
-        line_fmt = '{addr:08x}  {0:2/ }'
-        exs = [Ex(fmt='x', sz=8, endianess='=')]
+        line_fmt = '{addr:08x}  {0:2/  }'
+        exs = [Ex(fmt='x', sz=8, endianess=endianess)]
     else:
         raise ValueError("Spec '%s' not supported." % spec)
 
     yield from Formatter(line_fmt, *exs)._lines(mem, 0)
 
 
-def display(spec, mem):
-    print('\n'.join(out for _, out in idisplay(spec, mem)))
+def display(spec, mem, endianess='='):
+    print('\n'.join(out for _, out in idisplay(spec, mem, endianess)))
