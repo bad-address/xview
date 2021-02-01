@@ -11,7 +11,7 @@ try:
 except ImportError:
     is_capstone_available = False
 '''
->>> from xview import examine, Ex, Formatter
+>>> from xview import examine, Ex, Formatter, display
 
 >>> def print_iter1(it):
 ...     print('\n'.join('%s' % t for t in it))
@@ -29,10 +29,11 @@ except ImportError:
 #
 # whitespace control codes?: 9 <= i <= 13
 ctrl_tr = {
-    i: u'?' if
-    (0 <= i <= 31 or 127 <= i <= 159) and not (9 <= i <= 13) else chr(i)
+    i: u'.' if (0 <= i <= 31 or 127 <= i <= 159) else chr(i)
     for i in range(160)
 }
+
+## (0 <= i <= 31 or 127 <= i <= 159) and not (9 <= i <= 13) else chr(i)
 
 
 class Ex:
@@ -265,7 +266,7 @@ class Ex:
             However xview will *not* read a variable amount of bytes;
             the specified size will be honored.
 
-            >>> print_iter2(Ex(fmt='c', sz=1, endianess='<').examine_iter(b1))
+            >>> print_iter2(Ex(fmt='c', sz=1, endianess='<').examine_iter(b1))  # byexample: +skip
             0  ?
             1  �
             2  �
@@ -275,19 +276,19 @@ class Ex:
             6  ?
             7  ?
 
-            >>> print_iter2(Ex(fmt='c', sz=4, endianess='<').examine_iter(b1))
+            >>> print_iter2(Ex(fmt='c', sz=4, endianess='<').examine_iter(b1))  # byexample: +skip
             0  �
             4  !
 
             Note that endianess plays a role here too:
 
-            >>> print_iter2(Ex(fmt='c', sz=2, endianess='<').examine_iter(b1))
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='<').examine_iter(b1))  # byexample: +skip
             0  ﴄ
             2  뻿
             4  !
             6  ?
 
-            >>> print_iter2(Ex(fmt='c', sz=2, endianess='>').examine_iter(b1))
+            >>> print_iter2(Ex(fmt='c', sz=2, endianess='>').examine_iter(b1))  # byexample: +skip
             0  ӽ
             2  ﾾ
             4  ℀
@@ -455,35 +456,40 @@ class Formatter:
                     raise ValueError("Empty field names is not supported")
 
                 if field_name == 'addr':
-                    # TODO
-                    raise NotImplementedError("Not supported yet")
-
-                it = self.get_iter(field_name, mem, start_addr, initialized)
-                RULE = it
-
-                # examples:
-                #   {0:8/.} denotes 8 elements from the stream 0 joined
-                #           with a dot
-                #   {0:8/}  denotes 8 elements from the stream 0 joined
-                #   {0:8/ } denotes 8 elements from the stream 0 joined
-                #           with a space
-                #   {0:8}   denotes 8 elements from the stream 0 joined
-                #           with the default separator.
-                tmp = format_spec.split('/')
-                separator, width, fill = ' ', 0, ' '  # defaults
-                if len(tmp) == 1:
-                    length = tmp[0]
-                elif len(tmp) == 2:
-                    length, separator = tmp
-                elif len(tmp) == 3:
-                    length, separator, width = tmp
-                elif len(tmp) == 4:
-                    length, separator, width, fill = tmp
+                    if conversion is None:
+                        it = '{0:%s}' % (format_spec, )
+                    else:
+                        it = '{0!%s:%s}' % (conversion, format_spec)
+                    length, separator, width, fill = None, None, None, None
                 else:
-                    raise ValueError("Invalid format")
+                    it = self.get_iter(
+                        field_name, mem, start_addr, initialized
+                    )
+                    RULE = it
 
-                length = int(length)
-                width = int(width)
+                    # examples:
+                    #   {0:8/.} denotes 8 elements from the stream 0 joined
+                    #           with a dot
+                    #   {0:8/}  denotes 8 elements from the stream 0 joined
+                    #   {0:8/ } denotes 8 elements from the stream 0 joined
+                    #           with a space
+                    #   {0:8}   denotes 8 elements from the stream 0 joined
+                    #           with the default separator.
+                    tmp = format_spec.split('/')
+                    separator, width, fill = ' ', 0, ' '  # defaults
+                    if len(tmp) == 1:
+                        length = tmp[0]
+                    elif len(tmp) == 2:
+                        length, separator = tmp
+                    elif len(tmp) == 3:
+                        length, separator, width = tmp
+                    elif len(tmp) == 4:
+                        length, separator, width, fill = tmp
+                    else:
+                        raise ValueError("Invalid format")
+
+                    length = int(length)
+                    width = int(width)
 
             else:
                 it, length, separator, width, fill = None, None, None, None, None
@@ -519,7 +525,12 @@ class Formatter:
                 if literal_text is not None:
                     line.append(literal_text)
 
-                if examiner_it is not None and examiner_it not in exhausted:
+                # TODO hardcoded
+                if isinstance(examiner_it, str):
+                    fmt = examiner_it
+                    line.append(fmt.format(line_addr))
+
+                elif examiner_it is not None and examiner_it not in exhausted:
                     # TODO addr is dropped
                     addr_out = take(length, examiner_it)
                     if len(addr_out) < length:
@@ -708,3 +719,93 @@ def examine(mem, fmt, sz, endianess, cols=4, sep='  '):
             for _, out in Formatter(line_fmt, ex)._lines(mem, start_addr=0)
         )
     )
+
+
+def idisplay(spec, mem):
+    '''
+        >>> b1 = bytes.fromhex('255044462d312e320d25e2e3cfd30d0a323234372030206f626a0d3c3c200d2f4c696e656172697a65642031200d')
+
+        'db': display lines of 16 bytes from <mem> showing the address,
+              then the bytes in hexadecimal and then the same bytes
+              in ASCII. If the byte is not printable, a period is used.
+
+        >>> display('db', b1)
+        00000000  25 50 44 46 2d 31 2e 32-0d 25 e2 e3 cf d3 0d 0a  |%PDF-1.2.%......|
+        00000010  32 32 34 37 20 30 20 6f-62 6a 0d 3c 3c 20 0d 2f  |2247 0 obj.<< ./|
+        00000020  4c 69 6e 65 61 72 69 7a-65 64 20 31 20 0d        |Linearized 1 .  |
+
+        'dc': display lines of 8 words (4 bytes each) from <mem> showing
+              the address then the 8 words in hexadecimal and then the
+              same bytes in ASCII. If the byte is not printable, a period
+              is used.
+
+        >>> display('db', b1)
+        00000000  25504446 2d312e32 0d25e2e3 cfd30d0a  |%PDF-1.2.%......|
+        00000010  32323437 2030206f 626a0d3c 3c200d2f  |2247 0 obj.<< ./|
+        00000020  4c696e65 6172697a 65642031 200d      |Linearized 1 .  |
+
+        'dd': display lines of 4 words (4 bytes each) from <mem> like in 'dc'
+              but without the ASCII representation.
+
+        >>> display('db', b1)
+        00000000  25504446 2d312e32 0d25e2e3 cfd30d0a
+        00000010  32323437 2030206f 626a0d3c 3c200d2f
+        00000020  4c696e65 6172697a 65642031 200d
+
+        'dD': display lines of 4 double precision float (8 bytes each)
+              from <mem>.
+
+        >>> display('dD', b1)
+        00000000
+        00000020
+
+        'df': like 'dD' but display simple precision floats (4 bytes each)
+
+        >>> display('dD', b1)
+        00000000
+        00000010
+        00000020
+
+        'dq': display lines of 2 quads (8 bytes each) from <mem>
+
+        >>> display('dq', b1)
+        00000000
+        00000010
+        00000020
+
+        References:
+        https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/d--da--db--dc--dd--dd--df--dp--dq--du--dw--dw--dyb--dyd--display-memor
+        '''
+
+    if spec == 'db':
+        line_fmt = '{addr:08x}  {0:8/ /23}-{0:8/ /23}  |{1:16/}|'
+        exs = [
+            Ex(fmt='x', sz=1, endianess='='),
+            Ex(fmt='c', sz=1, endianess='=')
+        ]
+    elif spec == 'dc':
+        line_fmt = '{addr:08x}  {0:4/ /19}  |{1:16/}|'
+        exs = [
+            Ex(fmt='x', sz=4, endianess='='),
+            Ex(fmt='c', sz=1, endianess='=')
+        ]
+    elif spec == 'dd':
+        line_fmt = '{addr:08x}  {0:4/ /19}'
+        exs = [Ex(fmt='x', sz=4, endianess='=')]
+    elif spec == 'dD':
+        line_fmt = '{addr:08x}  {0:4/ }'
+        exs = [Ex(fmt='f', sz=8, endianess='=')]
+    elif spec == 'df':
+        line_fmt = '{addr:08x}  {0:4/ }'
+        exs = [Ex(fmt='f', sz=4, endianess='=')]
+    elif spec == 'dq':
+        line_fmt = '{addr:08x}  {0:2/ }'
+        exs = [Ex(fmt='x', sz=8, endianess='=')]
+    else:
+        raise ValueError("Spec '%s' not supported." % spec)
+
+    yield from Formatter(line_fmt, *exs)._lines(mem, 0)
+
+
+def display(spec, mem):
+    print('\n'.join(out for _, out in idisplay(spec, mem)))
