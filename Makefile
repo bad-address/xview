@@ -10,6 +10,7 @@ deps-dev: deps
 
 test: format-test
 	byexample -l python --ff  xview/*.py
+	byexample -l python,shell --ff  README.md
 
 
 ## Formatting

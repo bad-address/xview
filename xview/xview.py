@@ -773,8 +773,8 @@ def idisplay(
                 sz=0,
                 endianess=endianess,
                 extra_kargs={
-                    'arch': 'x86',
-                    'mode': 64
+                    'arch': extra_kargs.get('arch', 'x86'),
+                    'mode': extra_kargs.get('mode', 64)
                 }
             )
         ]
@@ -788,11 +788,13 @@ def idisplay(
         yield from it
 
 
-def display(spec, mem, endianess='=', start_addr=0, compress=False):
+def display(
+    spec, mem, endianess='=', start_addr=0, compress=False, extra_kargs={}
+):
     print(
         '\n'.join(
-            out
-            for out in idisplay(spec, mem, endianess, start_addr, compress)
+            out for out in
+            idisplay(spec, mem, endianess, start_addr, compress, extra_kargs)
         )
     )
 
