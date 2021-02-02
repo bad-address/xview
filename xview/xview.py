@@ -3,7 +3,7 @@ from functools import partial
 from struct import unpack
 from itertools import islice
 import string
-from more_itertools import peekable, take
+from more_itertools import peekable, take, unique_justseen
 
 try:
     import capstone
@@ -11,7 +11,7 @@ try:
 except ImportError:
     is_capstone_available = False
 '''
->>> from xview import examine, Ex, Formatter, display
+>>> from xview import Ex, Formatter, display, hexdump
 
 >>> def print_iter1(it):
 ...     print('\n'.join('%s' % t for t in it))
@@ -36,8 +36,10 @@ ctrl_tr[65533] = u'.'
 
 
 class Ex:
-    def __init__(self, fmt, sz, endianess):
-        self._validate_params(fmt, sz, endianess)
+    def __init__(self, fmt, sz, endianess, extra_kargs=None):
+        fmt, sz, endianess = self._validate_params(
+            fmt, sz, endianess, extra_kargs
+        )
         self._fmt = fmt
 
         self._unpacker, self._sz = self._build_unpacker(fmt, sz, endianess)
@@ -46,7 +48,7 @@ class Ex:
     def _are_we_examining_instructions(self):
         return self._fmt == 'i'
 
-    def _validate_params(self, fmt, sz, endianess):
+    def _validate_params(self, fmt, sz, endianess, extra_kargs):
         if fmt != 'i' and sz not in (1, 2, 4, 8):
             raise ValueError(
                 "Size '%s' unknown. Expected 1, 2, 4, or 8 bytes." % sz
@@ -54,14 +56,23 @@ class Ex:
 
         if fmt == 'i':
             try:
-                arch, mode = sz
-            except ValueError:
-                raise ValueError(
-                    "Unit must be a tuple with the architecture and mode for Capstone."
+                if extra_kargs is None:
+                    extra_kargs = {}  # make this to uniform the errors
+                arch, mode = extra_kargs['arch'], extra_kargs['mode']
+            except KeyError as err:
+                raise KeyError(
+                    "You need to pass the architecture and mode for Capstone: %s"
+                    % str(err)
                 )
 
             if not is_capstone_available:
                 raise ValueError("Capstone engine is not available.")
+
+            arch = getattr(capstone, 'CS_ARCH_' + str(arch).upper())
+            mode = getattr(capstone, 'CS_MODE_' + str(mode).upper())
+
+            # nasty trick to encode "the size".
+            sz = (arch, mode)
 
         if fmt not in (
             'x', 'd', 'u', 'o', 'b', 'a', 'c', 'f', 's', 'z', 'r', 'i'
@@ -89,6 +100,8 @@ class Ex:
             raise ValueError(
                 "Endianess type '%s' unknown. Expected (>)big, (<)little or (=)native."
             )
+
+        return fmt, sz, endianess
 
     def _build_unpacker(self, fmt, sz, endianess):
         if self._are_we_examining_instructions():
@@ -304,8 +317,8 @@ class Ex:
 
             Instructions are decoded too and invalid opcodes are marked
             as "bytes":
-            >>> from capstone import *
-            >>> print_iter2(Ex(fmt='i', sz=(CS_ARCH_X86, CS_MODE_64), endianess='<').examine_iter(b1))
+            >>> cnf = {'arch': 'x86', 'mode': 64}
+            >>> print_iter2(Ex(fmt='i', sz=0, endianess='<', extra_kargs=cnf).examine_iter(b1))
             0  add     al, 0xfd
             2  .byte   0xff
             3  mov     esi, 0x21
@@ -347,7 +360,9 @@ class Ex:
 
 
 class Formatter:
-    def __init__(self, line_fmt, *exs_in_args, **exs_in_kwargs):
+    def __init__(
+        self, line_fmt, compress_marker, *exs_in_args, **exs_in_kwargs
+    ):
         self._line_fmt = line_fmt
         self._examiner_by_key = {
             str(ix): ex
@@ -355,6 +370,7 @@ class Formatter:
         }
         self._examiner_by_key.update(exs_in_kwargs)
         self._formatter = string.Formatter()
+        self._compress_marker = compress_marker
 
     def _line_template(self, mem, start_addr):
         ''' Return a list of tuples (<literal_text>, <examiner it>,
@@ -426,15 +442,20 @@ class Formatter:
             each examiner must be the same otherwise one examiner
             will advance faster than other.
 
-            >>> b1 = bytes.fromhex('04fdffbe2100000041412121')
-            >>> f = Formatter(line_fmt, ex0, ex1)
+            If the line format has the special "{addr}" specifier,
+            this method will yield an <examiner_it> which will *not*
+            be an interator but a tuple (<format_spec>, <conversion>).
 
-            ### print('\n'.join(str(t) for t in f._line_template(b1, start_addr=1)))
-            ('line: ', <...>, 8, ' ', 23, ' ')
-            ('  ', <...>, 8, ' ', 23, ' ')
-            (' | ', <...>, 8, '', 0, ' ')
-            (' ', <...>, 8, '', 0, ' ')
+            The <format_spec> and <conversion> are extracted from the
+            format "{addr}" following the Python Formatter rules:
 
+                {addr}: equivalent to "%s"
+                {addr:x}: replace by the hexadecimal notation of addr
+                {addr:08x}: replace by the hexadecimal notation of addr, padded
+                            with zeros to complete a number of 8 digits.
+                {addr!s}: convert the addr to a string.
+
+            See lines() for more info.
         '''
         results = []
         f = self._formatter
@@ -493,7 +514,7 @@ class Formatter:
         # TODO check initialized against self._examiner_by_key
         return results, initialized, RULE
 
-    def _lines(self, mem, start_addr):
+    def lines(self, mem, start_addr, compress=False, ret_addresses=False):
         ''' Yields formatted lines from the examined <mem>.
             See _line_template.
 
@@ -502,17 +523,55 @@ class Formatter:
             >>> ex1 = Ex(fmt='x', sz=1, endianess='>')
 
             >>> b1 = bytes.fromhex('04fdffbe2100000041412121')
-            >>> f = Formatter(line_fmt, ex0, ex1)
+            >>> f = Formatter(line_fmt, None, ex0, ex1)
 
-            >>> print_iter2(f._lines(b1, start_addr=1))
-            1  line: 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
-            9  line: 41 41 21 21              | 41412121
+            >>> print_iter1(f.lines(b1, start_addr=0))
+            line: 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
+            line: 41 41 21 21              | 41412121
 
+            If the special {addr} is used, it will be replaced
+            by the address of the current line.
+
+            The {addr} is subject to rules of string formatting of Python
+            and *not* to the rules of xview.Formatter (so {addr:4/ /} has no
+            meaning and it is invalid).
+
+            >>> line_fmt = "{addr:08x} {0:4/ /11}  {0:4/ /11} | {1:4//4} {1:4//4}"
+            >>> f = Formatter(line_fmt, None, ex0, ex1)
+
+            >>> print_iter1(f.lines(b1, start_addr=0))
+            00000000 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
+            00000008 41 41 21 21              | 41412121
+
+            Negative starting addresses are supported (but may look uggly)
+
+            >>> print_iter1(f.lines(b1, start_addr=-4))
+            -0000004 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
+            00000004 41 41 21 21              | 41412121
+
+            If <compress> is True, repeated lines are suppressed and replaced
+            by <self._compress_marker>
+
+            >>> b2 = bytes.fromhex('aabbccdd00112233aabbccdd00112233aabbccdd00112233ffff')
+            >>> print_iter1(f.lines(b2, start_addr=0, compress=True))
+            00000000 aa bb cc dd  00 11 22 33 | aabbccdd 00112233
+            None
+            None
+            00000018 ff ff                    | ffff
+
+            Instead of yielding only the lines, the method can yield tuples
+            with the address of the line and the line itself.
+
+            >>> print_iter2(f.lines(b1, start_addr=0, ret_addresses=True))
+            0  00000000 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
+            8  00000008 41 41 21 21              | 41412121
         '''
         line = []
         template, initialized, RULE = self._line_template(mem, start_addr)
         exhausted = set()
         line_addr = None
+        cur_data = []
+        last_data = []
         while len(exhausted) < len(initialized):
             line_addr = RULE.peek()[0]
             for literal_text, examiner_it, length, separator, width, fill in template:
@@ -524,7 +583,7 @@ class Formatter:
                     fmt = examiner_it
                     line.append(fmt.format(line_addr))
 
-                elif examiner_it is not None and examiner_it not in exhausted:
+                elif examiner_it is not None:
                     # TODO addr is dropped
                     addr_out = take(length, examiner_it)
                     if len(addr_out) < length:
@@ -533,10 +592,22 @@ class Formatter:
                     if width:
                         out = out.ljust(width, fill)
                     line.append(out)
+                    cur_data.append(out)
 
             if line:
-                yield (line_addr, ''.join(line))
+                if compress and cur_data == last_data:
+                    out = self._compress_marker
+                else:
+                    out = ''.join(line)
+
+                if ret_addresses:
+                    yield (line_addr, out)
+                else:
+                    yield out
+
                 line = []
+                last_data = cur_data
+                cur_data = []
 
     def get_iter(self, key, mem, start_addr, initialized):
         ''' Return an examiner's iterator. The examiner is
@@ -576,146 +647,9 @@ def _format_ins(mnemonic, op_str, **kargs):
     return ''.join((mnemonic.ljust(8), op_str))
 
 
-# https://sourceware.org/gdb/current/onlinedocs/gdb/Memory.html
-# https://sourceware.org/gdb/current/onlinedocs/gdb/Output-Formats.html#Output-Formats
-# https://blog.mattjustice.com/2018/08/24/gdb-for-windbg-users/
-# invalid utf16: string s = "a\ud800b";
-def examine(mem, fmt, sz, endianess, cols=4, sep='  '):
-    ''' Examine a piece of memory <mem> in a similar but exactly
-        way that the GNU Debugger GDB does.
-
-        Assume the following bytes to be examined:
-
-        >>> b1 = bytes.fromhex('04fdffbe21000000')
-
-        The left lower-index side of the bytes are interpreted as
-        low addresses.
-
-        When you see the memory as a sequence of bytes this
-        is not important:
-        >>> examine(b1, fmt='x', sz=1, endianess='>')
-        04  fd  ff  be
-        21  00  00  00
-
-        In the example we saw the memory as bytes (sz=1) in hexadecimal
-        notation (fmt='x').
-
-        But when you see it as elements of more than one byte it is
-        where the endianess plays a role and which byte is less or
-        more significant is important.
-
-        Little endian (left/lower addresses are less significant;
-        "bytes are swapped"):
-        >>> examine(b1, fmt='x', sz=4, endianess='<')
-        befffd04  00000021
-
-        Big endian (left/lower addresses are more significant;
-        "bytes are not swapped"):
-        >>> examine(b1, fmt='x', sz=4, endianess='>')
-        04fdffbe  21000000
-
-        Big endian is equivalent to do slicing from the input bytes:
-        >>> b1[0:4].hex(), b1[4:8].hex()
-        ('04fdffbe', '21000000')
-
-        Decimal (signed (d) and unsigned (u)) interpretations:
-
-        >>> examine(b1, fmt='d', sz=4, endianess='<')
-        -1090519804  33
-
-        >>> examine(b1, fmt='u', sz=4, endianess='<')
-        3204447492  33
-
-        Octal (o) and binary (b) interpretations are also available.
-        Them differs a little from GDB's output: we always pad the
-        numbers' representations to complete the given size (4 bytes
-        in the next example):
-
-        >>> examine(b1, fmt='o', sz=4, endianess='<')
-        027677776404  000000000041
-
-        >>> examine(b1, fmt='b', sz=4, endianess='<')
-        10111110111111111111110100000100  00000000000000000000000000100001
-
-        Note: GDB uses 't' for binary.
-
-        A raw (r) view also exists and it is equivalent to do slicing
-        (endianess here is ignore and forced to be 'big endian'.
-
-        This differs from GDB where 'raw' means 'do not pretty print'.
-        Not applicable to us.
-
-        >>> examine(b1, fmt='r', sz=4, endianess='<')
-        b'\x04\xfd\xff\xbe'  b'!\x00\x00\x00'
-
-        When the (c)har format is used, the interpretation of <sz>
-        changes: not only specifies how much bytes each character
-        will consume but also which encoding to use to decode it.
-
-            sz==1 reads 1 byte and decodes it as utf-8
-            sz==2 reads 2 bytes and decode them as utf-16
-            sz==4 reads 4 bytes and decode them as utf-32
-
-        Sizes of 8 are not supported.
-
-        Note that utf-8 and utf-16 are *variable size* decoders:
-        a single character may require 1 or more bytes to be decoded.
-
-        However xview will *not* read a variable amount of bytes;
-        the specified size will be honored.
-
-        GDB does something weird in this case: it reads the same amount
-        of bytes than xview but then it sees the read number module 256
-        and print it as a char and an octal.
-
-        We believe that this is less usable. Instead xview follows
-        more the GDB approach of the 's' format and tries to show
-        the input as strings.
-
-        The following shows the input as two characters (c) of
-        4 bytes each one in utf-32:
-
-        >>> examine(b1, fmt='c', sz=4, endianess='<')
-        .  !
-
-        Note that endianess plays a role here too:
-
-        >>> examine(b1, fmt='c', sz=2, endianess='<')
-        ﴄ  뻿  ! <...>
-
-        >>> examine(b1, fmt='c', sz=2, endianess='>')
-        ӽ  ﾾ  ℀  <...>
-
-        Float point interpretation is supported only for 4 and
-        8 bytes sizes.
-
-        >>> examine(b1, fmt='f', sz=4, endianess='<')
-        -4.999772e-01  4.624285e-44
-
-        >>> examine(b1, fmt='f', sz=8, endianess='<')
-        7.160907e-313
-
-        >>> examine(b1, fmt='f', sz=2, endianess='<')
-        Traceback<...>
-        ValueError: Format (f)loat can work only with 4 and 8 sizes but received '2'
-
-        >>> from capstone import *
-        >>> examine(b1, cols=1, fmt='i', sz=(CS_ARCH_X86, CS_MODE_64), endianess='<')
-        add     al, 0xfd
-        .byte   0xff
-        mov     esi, 0x21
-        '''
-    ex = Ex(fmt, sz, endianess)
-    line_fmt = '{0:%i/%s}' % (cols, sep)
-    print(
-        '\n'.join(
-            out
-            for _, out in Formatter(line_fmt, ex)._lines(mem, start_addr=0)
-        )
-    )
-
-
-def idisplay(spec, mem, endianess='='):
+def idisplay(
+    spec, mem, endianess='=', start_addr=0, compress=False, extra_kargs={}
+):
     '''
         >>> b1 = bytes.fromhex('255044462d312e320d25e2e3cfd30d0a323234372030206f626a0d3c3c200d2f4c696e656172697a65642031200d')
 
@@ -779,8 +713,31 @@ def idisplay(spec, mem, endianess='='):
         00000010  6f20302037343232  2f0d203c3c0d6a62
         00000020  7a697261656e694c
 
+        'uu': disassembly the memory into instructions. Display as raw bytes
+              the pieces of memory that couldn't be disassembled.
+
+        >>> display('uu', b1)
+        00000000  and     eax, 0x2d464450
+        00000005  xor     dword ptr [rsi], ebp
+        00000007  xor     cl, byte ptr [rip - 0x301c1ddb]
+        0000000d  ror     dword ptr [rip + 0x3432320a], cl
+        00000013  .byte   0x37
+        00000014  and     byte ptr [rax], dh
+        00000016  and     byte ptr [rdi + 0x62], ch
+        00000019  push    0xd
+        0000001b  cmp     al, 0x3c
+        0000001d  and     byte ptr [rip + 0x6e694c2f], cl
+        00000023  .byte   0x65
+        00000024  .byte   0x61
+        00000025  jb      0x90
+        00000027  jp      0x8e
+        00000029  and     byte ptr fs:[rcx], dh
+        0000002c  .byte   0x20
+        0000002d  .byte   0x0d
+
         References:
         https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/d--da--db--dc--dd--dd--df--dp--dq--du--dw--dw--dyb--dyd--display-memor
+        https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/u--unassemble-
         '''
 
     if spec == 'db':
@@ -807,11 +764,81 @@ def idisplay(spec, mem, endianess='='):
     elif spec == 'dq':
         line_fmt = '{addr:08x}  {0:2/  }'
         exs = [Ex(fmt='x', sz=8, endianess=endianess)]
+    elif spec == 'uu':
+        line_fmt = '{addr:08x}  {0:1}'
+
+        exs = [
+            Ex(
+                fmt='i',
+                sz=0,
+                endianess=endianess,
+                extra_kargs={
+                    'arch': 'x86',
+                    'mode': 64
+                }
+            )
+        ]
     else:
         raise ValueError("Spec '%s' not supported." % spec)
 
-    yield from Formatter(line_fmt, *exs)._lines(mem, 0)
+    it = Formatter(line_fmt, '*', *exs).lines(mem, start_addr, compress)
+    if compress:
+        yield from unique_justseen(it)
+    else:
+        yield from it
 
 
-def display(spec, mem, endianess='='):
-    print('\n'.join(out for _, out in idisplay(spec, mem, endianess)))
+def display(spec, mem, endianess='=', start_addr=0, compress=False):
+    print(
+        '\n'.join(
+            out
+            for out in idisplay(spec, mem, endianess, start_addr, compress)
+        )
+    )
+
+
+def ihexdump(mem, start_addr=0, compress=False):
+    line_fmt = '{addr:08x}  {0:8/ /23}  {0:8/ /23}  |{1:16//16}|'
+    exs = [Ex(fmt='x', sz=1, endianess='='), Ex(fmt='c', sz=1, endianess='=')]
+
+    it = Formatter(line_fmt, '*', *exs).lines(mem, start_addr, compress)
+    if compress:
+        yield from unique_justseen(it)
+    else:
+        yield from it
+
+
+def hexdump(mem, start_addr=0, compress=False):
+    '''
+        Display the bytes of <mem> in 16-bytes lines showing
+        them twice: one as hexadecimal numbers and the other
+        as ASCII characters.
+
+        If a ASCII character is not printable, a period is used.
+
+        At the begin of each line the address of the line is shown
+        in hexadecimal.
+
+        >>> b1 = bytes.fromhex('255044462d312e320d25e2e3cfd30d0a323234372030206f626a0d3c3c200d2f4c696e656172697a65642031200d')
+        >>> hexdump(b1)
+        00000000  25 50 44 46 2d 31 2e 32  0d 25 e2 e3 cf d3 0d 0a  |%PDF-1.2.%......|
+        00000010  32 32 34 37 20 30 20 6f  62 6a 0d 3c 3c 20 0d 2f  |2247 0 obj.<< ./|
+        00000020  4c 69 6e 65 61 72 69 7a  65 64 20 31 20 0d        |Linearized 1 .  |
+
+        The starting address can be changed even it can be negative:
+
+        >>> hexdump(b1, start_addr=-0x10)
+        -0000010  25 50 44 46 2d 31 2e 32  0d 25 e2 e3 cf d3 0d 0a  |%PDF-1.2.%......|
+        00000000  32 32 34 37 20 30 20 6f  62 6a 0d 3c 3c 20 0d 2f  |2247 0 obj.<< ./|
+        00000010  4c 69 6e 65 61 72 69 7a  65 64 20 31 20 0d        |Linearized 1 .  |
+
+        Consecutive repeating lines can be suppressed:
+
+        >>> b2 = bytes.fromhex('aa' + 'ff' * 128 + 'bb')
+        >>> hexdump(b2, compress=True)
+        00000000  aa ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  |................|
+        00000010  ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  |................|
+        *
+        00000080  ff bb                                             |..              |
+    '''
+    print('\n'.join(out for out in ihexdump(mem, start_addr, compress)))
