@@ -372,11 +372,11 @@ class Formatter:
         self._formatter = string.Formatter()
         self._compress_marker = compress_marker
 
-    def _line_template(self, mem, start_addr):
-        ''' Return a list of tuples (<literal_text>, <examiner it>,
+    def _line_template(self, mem, start_addr, ruler):
+        ''' Returns a list of tuples (<literal_text>, <examiner it>,
             <length>, <separator>, <width>, <fill>).
 
-            Each tuple describe what literal text forms the line before the
+            Each tuple describes what literal text forms the line before the
             output of the examiner (the literal could be empty).
 
             The examiner's iterator is already initialized with <mem> and
@@ -404,7 +404,7 @@ class Formatter:
 
             >>> line_fmt = "line: {0:8/ /23/ }  {0:8/ /23/ } | {1:8/} {1:8/}"
 
-            The <self._line_fmt> uses 2 examiners "0" ans "1". There
+            The <self._line_fmt> uses 2 examiners "0" and "1". There
             are 2 "calls" to each examiner: 2 calls are made
             to the examiner "0" to read 8 elements in each occasion ({0:8/ /23/ })
             and 2 more calls to the examiner "1" also to read 8 elements
@@ -461,14 +461,21 @@ class Formatter:
         f = self._formatter
         line_fmt = self._line_fmt
 
-        RULE = None
+        # we support integers because it is natural to use them to refer
+        # the 3rd examiner like in {2} but Python will not return an int
+        # but a string for '2'. To simplify the comparisons later we
+        # normalize it to str.
+        if isinstance(ruler, int):
+            ruler = str(ruler)
+
+        RULER = None
         initialized = {}
         for literal_text, field_name, format_spec, conversion in f.parse(
             line_fmt
         ):
             if field_name is not None:
                 if field_name == '':
-                    raise ValueError("Empty field names is not supported")
+                    raise ValueError("Empty field names are not supported")
 
                 if field_name == 'addr':
                     if conversion is None:
@@ -480,7 +487,13 @@ class Formatter:
                     it = self.get_iter(
                         field_name, mem, start_addr, initialized
                     )
-                    RULE = it
+
+                    # Pick the first examiner_it as the ruler if not one was
+                    # specified, otherwise pick the named one.
+                    if RULER is None and (
+                        ruler is None or field_name == ruler
+                    ):
+                        RULER = it
 
                     # examples:
                     #   {0:8/.} denotes 8 elements from the stream 0 joined
@@ -511,10 +524,22 @@ class Formatter:
 
             results.append((literal_text, it, length, separator, width, fill))
 
-        # TODO check initialized against self._examiner_by_key
-        return results, initialized, RULE
+        if RULER is None:
+            raise ValueError(
+                f"The examiner '{ruler}' is not in the line format and cannot be used as the ruler."
+            )
 
-    def lines(self, mem, start_addr, compress=False, ret_addresses=False):
+        # TODO check initialized against self._examiner_by_key
+        return results, initialized, RULER
+
+    def lines(
+        self,
+        mem,
+        start_addr,
+        compress=False,
+        ret_addresses=False,
+        ruler=None
+    ):
         ''' Yields formatted lines from the examined <mem>.
             See _line_template.
 
@@ -559,21 +584,91 @@ class Formatter:
             None
             00000018 ff ff                    | ffff
 
+            And works even if the repeated line is the last one.
+
+            >>> b3 = bytes.fromhex('aabbccdd00112233aabbccdd00112233')
+            >>> print_iter1(f.lines(b3, start_addr=0, compress=True))
+            00000000 aa bb cc dd  00 11 22 33 | aabbccdd 00112233
+            None
+
             Instead of yielding only the lines, the method can yield tuples
             with the address of the line and the line itself.
 
             >>> print_iter2(f.lines(b1, start_addr=0, ret_addresses=True))
             0  00000000 04 fd ff be  21 00 00 00 | 04fdffbe 21000000
             8  00000008 41 41 21 21              | 41412121
+
+            The line addresses (called the ruler) are taken from the first
+            examiner but this can be changed. In theory this should not have
+            any noticeable change.
+
+            >>> print_iter1(f.lines(b3, start_addr=0, ruler=1))
+            00000000 aa bb cc dd  00 11 22 33 | aabbccdd 00112233
+            00000008 aa bb cc dd  00 11 22 33 | aabbccdd 00112233
+
+            >>> print_iter1(f.lines(b'', start_addr=0, ruler=1)) # nothing to print
+
+            But the ruler is important because once the ruler iterator gets
+            exhausted, the lines() iterator will finish regardless if the rest
+            of the examiners were exhausted or not.
+
+            If one examiner gets exhausted and *after* that the ruler does not
+            get exhausted, an exception will be raised.
+
+            >>> ex_fast = Ex(fmt='x', sz=4, endianess='>')
+            >>> f = Formatter(line_fmt, None, ex0, ex_fast)
+
+            >>> print_iter1(f.lines(b3, start_addr=0))
+            <...>
+            ValueError: The 1 examiners got exhausted earlier before the ruler: ['1']
+
+            Using the fastest examiner as the ruler fixes that but it is *very*
+            likely that the examiners get out of sync (it is very likely that
+            you are having a bug).
+
+            In the following example the left side shows 8 bytes but the right
+            side shows 16!
+
+            >>> print_iter1(f.lines(b3, start_addr=0, ruler=1))
+            00000000 aa bb cc dd  00 11 22 33 | aabbccdd00112233aabbccdd00112233
+
+            Using a non existent ruler will fail. The ruler is always required.
+            If you don't want to have the addresses in the output, just don't
+            put '{addr}'
+
+            >>> f = Formatter(line_fmt, None, ex0, ex1)
+            >>> print_iter1(f.lines(b3, start_addr=0, ruler="foobar"))
+            <...>
+            ValueError: The examiner 'foobar' is not in the line format and cannot be used as the ruler.
+
         '''
         line = []
-        template, initialized, RULE = self._line_template(mem, start_addr)
+        ruler = str(ruler) if ruler else ruler  # stringnify it unless is None
+        template, initialized, RULER = self._line_template(
+            mem, start_addr, ruler
+        )
         exhausted = set()
         line_addr = None
         cur_data = []
         last_data = []
-        while len(exhausted) < len(initialized):
-            line_addr = RULE.peek()[0]
+        while True:
+            try:
+                line_addr = RULER.peek()[0]
+            except StopIteration:
+                assert not line
+                break
+
+            if exhausted:
+                keys = []
+                for ex in exhausted:
+                    for k, v in initialized.items():
+                        if v == ex:
+                            keys.append(k)
+                keys = list(sorted(keys))
+                raise ValueError(
+                    f"The {len(keys)} examiners got exhausted earlier before the ruler: {keys}"
+                )
+
             for literal_text, examiner_it, length, separator, width, fill in template:
                 if literal_text is not None:
                     line.append(literal_text)
