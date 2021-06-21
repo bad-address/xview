@@ -1,6 +1,6 @@
 '''Examine memory views/bytes pretty printing it.'''
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 _author = 'Di Paola Martin'
 _license = 'GNU LGPLv3'
